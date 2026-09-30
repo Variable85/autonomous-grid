@@ -163,7 +163,13 @@ def _stamp_own_pid(grid_id: str, engine_id: str) -> None:
     reload bookkeeping's never-raise contract)."""
     try:
         with file_lock(run_records.record_path(grid_id, engine_id)):
-            run_records.update_record(grid_id, engine_id, **run_records.identity_stamp(os.getpid()))
+            run_records.update_record(
+                grid_id, engine_id, **run_records.identity_stamp(os.getpid()),
+                # Said by the CHILD, not written by the CLI: a hot-reload rewrites the record under a
+                # running child it did not spawn, so only the child can vouch that its reload reads each
+                # engine's own aliases (ADR 0045). An older child never says it, and is respawned instead.
+                per_engine_aliases=True,
+            )
             # Declare, before any socket is opened, that this build reports service truth (issue 10).
             # The sidecar's ABSENCE is what keeps the join gate quiet about an older build's child, so
             # this must land here rather than at first registration: the incident regime is a child
@@ -436,14 +442,12 @@ def _bring_up_engines(
     a spec serves is probed by its upstream name (Ollama/vLLM only know that) but the caps envelope is
     keyed by the advertised name (what consumers ask for), so a spec serving several models advertises
     caps for all of them, not just the first. ``launched`` collects the built-in llama-servers to stop
-    on teardown (empty when every engine is external). Only a built-in ``--serve`` launches, and only as
-    the **sole** engine: ``grid join --all`` gathers already-running engines, so a multi-engine record
-    is all external URLs.
+    on teardown (empty when every engine is external). Each built-in ``--serve`` spec launches its OWN
+    llama-server, with its own settings, on the next free port — one identity can serve several
+    built-in models, beside external ones (ADR 0045). They start one after another, so each finds the
+    ports the ones before it took already bound.
     """
     specs = record.get("engines") or [_flat_spec(record)]
-    aliases = list(record.get("advertise_as") or [])
-    if len(specs) > 1 and any(not spec.get("endpoint_url") for spec in specs):
-        raise SystemExit("Serving several engines needs external endpoints; the built-in engine serves one model.")
 
     results: list[tuple[str, list[str], list[str], dict[str, Any]]] = []
     launched: list[Any] = []
@@ -455,6 +459,7 @@ def _bring_up_engines(
     unprobed: list[str] = []
     try:
         for spec in specs:
+            aliases = run_records.spec_aliases(spec, record, len(specs))
             llm_url, proc, mod, advertised, upstream = _bring_up_one(spec, record, aliases)
             if proc is not None:
                 launched.append(proc)
@@ -463,7 +468,7 @@ def _bring_up_engines(
             # caps for all of them — shared with the hot-reload path (`_reload_once`) so the two can't drift.
             try:
                 caps = _probe_spec_caps(
-                    llm_url, advertised, upstream, record.get("ctx_size"), api_kind=spec.get("api_kind"),
+                    llm_url, advertised, upstream, _spec_ctx_size(spec, record), api_kind=spec.get("api_kind"),
                     model_caps=spec.get("model_caps"), deadline=deadline,
                 )
             except bringup.ProbeBudgetExceeded as exc:
@@ -507,6 +512,14 @@ def _degraded_caps(exc: bringup.ProbeBudgetExceeded, ctx_size: Any) -> dict[str,
     return {"schema_version": 1, "models": models} if models else {}
 
 
+def _spec_ctx_size(spec: dict[str, Any], record: dict[str, Any]) -> Any:
+    """The context window a spec's capabilities are advertised with: a built-in engine's own
+    ``--ctx-size`` (it launched with it), an external engine's the record's."""
+    if spec.get("endpoint_url") or spec.get("api_kind"):
+        return record.get("ctx_size")
+    return run_records.builtin_launch(spec, record)["ctx_size"]
+
+
 def _flat_spec(record: dict[str, Any]) -> dict[str, Any]:
     """A record written before multi-engine (no ``engines``) → one spec from its flat fields.
     Never carries ``api_kind``: api specs postdate the ``engines`` array, so a flat record can't
@@ -528,7 +541,8 @@ def _bring_up_one(
     (Ollama/vLLM don't know the ``--advertise-as`` alias), but the **alias** for a built-in llama-server
     — it is launched with ``--alias advertised``, so that alias *is* its model name. For an external
     engine nothing is launched (``launched``/``launcher`` are ``None``). Launch tuning (port, ctx, …)
-    comes from the record's top-level fields — only the single built-in path consumes them.
+    is the spec's own (``run_records.builtin_launch``), falling back to the record's top-level fields
+    for a record written when an identity could hold only one built-in engine.
     """
     models = list(spec.get("models") or [])
     api_kind = spec.get("api_kind")
@@ -549,7 +563,8 @@ def _bring_up_one(
     from shared.engine import launcher as launcher_mod
     from local import runtime
 
-    port = int(record.get("endpoint_port") or 8081)
+    launch = run_records.builtin_launch(spec, record)
+    port = int(launch["endpoint_port"] or 8081)
     if runtime.port_in_use(port):
         # The exact bug already fixed once for the LOCAL `--serve` join (`cli/provider.py`) —
         # this is `remote/serve.py`'s own separate copy of the same check, missed at the time
@@ -571,13 +586,14 @@ def _bring_up_one(
     launched = launcher_mod.start_llm(
         models[0],
         port=port,
-        ctx_size=record.get("ctx_size"),
-        n_predict=record.get("n_predict"),
-        parallel=run_records.effective_parallel(record),
-        flash_attn=record.get("flash_attn"),
-        mmproj=record.get("mmproj"),
-        temp=record.get("temp"),
-        reasoning_budget=record.get("reasoning_budget"),
+        ctx_size=launch["ctx_size"],
+        n_predict=launch["n_predict"],
+        # Only `--parallel` is per engine; the concurrency it defaults from is the identity's.
+        parallel=run_records.effective_parallel({**record, "parallel": launch["parallel"]}),
+        flash_attn=launch["flash_attn"],
+        mmproj=launch["mmproj"],
+        temp=launch["temp"],
+        reasoning_budget=launch["reasoning_budget"],
         alias=advertised[0],
     )
     print(f"Spawned llama-server pid={launched.proc.pid}, log={launched.log}")
@@ -1932,15 +1948,13 @@ def _reload_once(state: _ServeState, engine_id: str) -> None:
     specs = record.get("engines") or (
         [_flat_spec(record)] if (record.get("endpoint_url") or record.get("models")) else []
     )
-    aliases = list(record.get("advertise_as") or [])
     # These refusals mean the CLI signalled something it should have respawned (or a manual SIGHUP) —
     # surface them, don't hide behind GRID_ENGINE_DEBUG (the CLI already reported the join/leave).
     if any(not spec.get("endpoint_url") for spec in specs):
         _warn("reload: record needs a built-in launch; refusing (respawn required)")
         return
-    if len(specs) > 1 and aliases:
-        _warn("reload: multi-engine identity with --advertise-as; refusing (respawn required)")
-        return
+    # Several aliased engines are fine: each spec carries its own aliases (ADR 0045), and a record that
+    # doesn't — one written before that — only ever aliased a sole engine (`run_records.spec_aliases`).
     if _media_signature(record) != state.media_signature:
         _warn("reload: media config changed; refusing (respawn required)")
         return
@@ -1963,7 +1977,10 @@ def _reload_once(state: _ServeState, engine_id: str) -> None:
         api_kind = spec.get("api_kind")
         # An api spec's advertised names ARE its record models; its upstream names are the vendor
         # names they embed — on BOTH branches below, or a reload would forward `openai:*` verbatim.
-        advertised = list(models) if api_kind else _advertised_models(models, aliases)
+        advertised = (
+            list(models) if api_kind
+            else _advertised_models(models, run_records.spec_aliases(spec, record, len(specs)))
+        )
         upstream = [_api_upstream_name(api_kind, m) for m in models] if api_kind else list(models)
         prev = retained.get(url)
         if prev is not None and prev[1][:1] == advertised[:1]:

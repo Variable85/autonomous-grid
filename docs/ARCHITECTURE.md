@@ -231,6 +231,9 @@ of `__engine`. That subprocess (`remote/serve.py:run_remote_engine_from_record`)
 4. `grid join --all` serves several local engines under **one** identity: it registers the union
    of their models and routes each polled job to the engine serving the requested `body["model"]`
    (first-detected wins on a duplicate). See [ADR 0007](adr/0007-remote-multi-engine-routing.md).
+   The union may hold several built-in `--serve` models beside external engines: each built-in
+   spec launches its own llama-server with its own settings and aliases, stored on the spec
+   (`launch`, `advertise_as`). See [ADR 0045](adr/0045-one-machine-serves-several-models-on-a-grid.md).
 5. `grid join --media` also brings up ComfyUI + the media server, registers the `comfyui:*`
    workflows the host's VRAM gates in, and forwards `media/*` jobs to the media server on loopback
    (always streamed SSE) — media-only or alongside a text engine. See

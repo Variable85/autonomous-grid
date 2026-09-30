@@ -59,7 +59,9 @@ printed. Vocabulary: `engine` / `grid` / `model` on the surface — `node_id` is
    per slot, so the provider serves `max_concurrency` jobs concurrently and `<aggregate inflight>`
    genuinely ranges 0..N instead of being capped at 1 by a single synchronous loop.
 
-4. **Multi-engine is external-only; the built-in launch stays single-engine.** `--all` only gathers
+4. **Multi-engine is external-only; the built-in launch stays single-engine.** **Superseded by
+   [ADR 0045](./0045-one-machine-serves-several-models-on-a-grid.md):** each built-in spec now launches
+   its own llama-server and carries its own settings and aliases. `--all` only gathers
    already-running engines (each has an `endpoint_url`), so nothing is launched for a multi-engine
    record, and `_bring_up_engines` rejects a multi-engine record that would need a built-in launch
    (a spec with no `endpoint_url`). The built-in `llama-server` path (`--serve`, one model) is

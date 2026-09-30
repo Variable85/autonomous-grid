@@ -216,7 +216,7 @@ def match_engine(
 ) -> list[dict[str, Any]]:
     """Engine spec(s) a `grid leave --engine <selector>` picks out of ``specs``, tried in order: exact
     ``endpoint_url`` → exact ``engine_label`` → the ``--name`` given at join (``meta_name``, remote only —
-    what `grid engines` prints under NODE) → a served model → an ``endpoint_url`` substring. Each match
+    what `grid engines` prints under NODE) → a served model or its alias → an ``endpoint_url`` substring. Each match
     must resolve to exactly ONE engine or it raises ``SystemExit`` (naming ``summary`` and ``hint``);
     returns ``[]`` on no match so the caller raises its own not-found. Returned dicts are the SAME objects
     passed in — identity is preserved for an ``id()``-based drop filter. An exact engine-*id* match is the
@@ -248,7 +248,12 @@ def match_engine(
     by_node = unique([s for s in specs if s.get("meta_name") == selector], "Node")
     if by_node:
         return by_node
-    by_model = unique([s for s in specs if selector in (s.get("models") or [])], "Model")
+    # A built-in engine has no URL, so its model — or the alias it was advertised as — is the only
+    # handle a person has on it once one identity runs several (ADR 0045).
+    by_model = unique(
+        [s for s in specs if selector in (s.get("models") or []) or selector in (s.get("advertise_as") or [])],
+        "Model",
+    )
     if by_model:
         return by_model
     return unique([s for s in specs if selector in (s.get("endpoint_url") or "")], "URL fragment")
@@ -306,6 +311,53 @@ def effective_parallel(record: dict[str, Any]) -> int:
     """
     explicit = record.get("parallel")
     return int(explicit) if explicit else max(1, effective_max_concurrency(record))
+
+
+BUILTIN_LAUNCH_FIELDS = (
+    "endpoint_port", "ctx_size", "n_predict", "parallel", "flash_attn", "mmproj", "temp", "reasoning_budget",
+)
+"""The `--serve` tuning one built-in llama-server launches with (ADR 0045)."""
+
+
+def builtin_launch(spec: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """The launch settings of one built-in (``--serve``) engine spec.
+
+    Its own ``launch`` when it has one — every built-in spec written since one identity can run several
+    carries it, so a later join's flags never retune an engine that join did not name (ADR 0045). A
+    record written before that holds its SOLE built-in's settings at the top level, where they are read
+    back from instead; that is also the only shape an older serve child understands.
+    """
+    own = spec.get("launch")
+    source = own if isinstance(own, dict) else record
+    return {field: source.get(field) for field in BUILTIN_LAUNCH_FIELDS}
+
+
+def spec_aliases(spec: dict[str, Any], record: dict[str, Any], spec_count: int) -> list[str]:
+    """A spec's ``--advertise-as`` aliases, positionally matching its ``models``.
+
+    Its own list when it carries one (ADR 0045: aliases belong to the engine they were given for, so
+    they survive a join that appends another engine). A record written before that kept one flat list
+    at the top level, which only ever belonged to a SOLE engine — so it applies to a lone spec and to
+    nothing in a union.
+    """
+    if "advertise_as" in spec:
+        return list(spec.get("advertise_as") or [])
+    return list(record.get("advertise_as") or []) if spec_count == 1 else []
+
+
+def union_aliases(specs: list[dict[str, Any]]) -> list[str]:
+    """The record's top-level ``advertise_as``: every advertised name across ``specs`` once, in order —
+    a spec without aliases contributes its model names — or ``[]`` when no spec is aliased, which is
+    what an unaliased record has always said. For a lone spec this is exactly its aliases, the shape
+    every reader of the flat list already knows."""
+    if not any(spec.get("advertise_as") for spec in specs):
+        return []
+    names = (
+        name
+        for spec in specs
+        for name in (spec.get("advertise_as") or spec.get("models") or [])
+    )
+    return list(dict.fromkeys(names))
 
 
 def _win_pid_alive(pid: int) -> bool:
