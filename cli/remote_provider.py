@@ -370,6 +370,7 @@ def cmd_remote_join(args: argparse.Namespace) -> int:
         media_detected = False
     else:
         specs, media_detected, deferred_target_error = _resolve_or_defer(args, respawn=respawn)
+        _attach_aliases(specs, list(getattr(args, "advertise_as", None) or []))
     media = bool(getattr(args, "media", False)) or media_detected
     if not specs and not media and deferred_target_error is None:
         # engines detected and the operator declined, or nothing to serve
@@ -495,7 +496,7 @@ def cmd_remote_join(args: argparse.Namespace) -> int:
         dropped_claim = _dropped_name_claim_note(live, meta_name, name_chosen)
         if dropped_claim:
             print(dropped_claim, file=sys.stderr)
-        _reject_unserveable_union(merged_specs, args, base)
+        _reject_unserveable_union(merged_specs)
         _warn_shadowed_models(merged_specs)  # the serve loop logs this too; show it on the operator's terminal
 
         record = _build_record(
@@ -1074,6 +1075,12 @@ def _merge_engines(
             changed = True
             continue
         added = [m for m in (spec.get("models") or []) if m not in (existing.get("models") or [])]
+        if existing.get("advertise_as") or spec.get("advertise_as"):
+            existing["advertise_as"] = _merged_aliases(existing, spec, added)
+        if spec.get("launch"):
+            # The flags of the join that names this built-in are its settings from now on. Not a change
+            # by itself — an identical re-join stays a no-op, exactly as before; `--respawn` applies it.
+            existing["launch"] = dict(spec["launch"])
         if added:
             existing["models"] = list(existing.get("models") or []) + added
             changed = True
@@ -1094,6 +1101,18 @@ def _merge_engines(
     return merged, changed
 
 
+def _merged_aliases(existing: dict[str, object], incoming: dict[str, object], added: list[str]) -> list[str]:
+    """``existing``'s aliases once ``incoming``'s ``added`` models join it, one per model, in model order.
+
+    A model keeps the alias it was given; the join naming it again may give it a new one; a model that
+    was never aliased is advertised as itself — the default `--advertise-as` has always meant.
+    """
+    models = list(existing.get("models") or []) + added
+    before = dict(zip(existing.get("models") or [], existing.get("advertise_as") or existing.get("models") or []))
+    given = dict(zip(incoming.get("models") or [], incoming.get("advertise_as") or []))
+    return [str(given.get(model) or before.get(model) or model) for model in models]
+
+
 def _engine_union(records: list[dict[str, object]]) -> list[dict[str, object]]:
     """The merged union of every engine across ``records`` (same engine → models unioned). A record with no
     ``engines`` array falls back to a flat spec so a pre-multi-engine live record isn't silently lost."""
@@ -1102,8 +1121,25 @@ def _engine_union(records: list[dict[str, object]]) -> list[dict[str, object]]:
         specs = record.get("engines")
         if not specs and (record.get("endpoint_url") or record.get("models")):
             specs = [_flat_spec(record)]
-        union, _ = _merge_engines(union, specs or [])
+        specs = [_owning_its_settings(spec, record, len(specs or [])) for spec in specs or []]
+        union, _ = _merge_engines(union, specs)
     return union
+
+
+def _owning_its_settings(spec: dict[str, object], record: dict[str, object], spec_count: int) -> dict[str, object]:
+    """A copy of ``spec`` that holds its own aliases and — for a built-in engine — its own launch settings.
+
+    A record written while an identity could run only one built-in engine kept both at the top level,
+    where the NEXT join's flags would overwrite them. Moving them onto the spec before the merge is
+    what lets a join append a second engine without retuning or un-aliasing the first (ADR 0045).
+    """
+    own = dict(spec)
+    aliases = run_records.spec_aliases(spec, record, spec_count)
+    if aliases:
+        own["advertise_as"] = aliases
+    if not own.get("endpoint_url") and not own.get("api_kind"):
+        own["launch"] = run_records.builtin_launch(spec, record)
+    return own
 
 
 def _identity_record(live: list[dict[str, object]]) -> dict[str, object] | None:
@@ -1176,27 +1212,21 @@ def _dropped_name_claim_note(
     )
 
 
-def _reject_unserveable_union(
-    merged_specs: list[dict[str, object]], args: argparse.Namespace, live: list[dict[str, object]]
-) -> None:
-    """Guard the merged union: the built-in engine can't join a multi-engine identity (external-only,
-    ADR 0007 D4), and ``--advertise-as`` aliases only a single engine (so appending onto an already-aliased
-    identity is rejected rather than silently dropping the alias)."""
-    if len(merged_specs) > 1 and any(not spec.get("endpoint_url") for spec in merged_specs):
-        raise SystemExit(
-            "The built-in engine (`--serve`) serves a single model and can't join a multi-engine "
-            "identity. Run `grid leave`, then re-join every engine as external `--at <url> -m <model>`."
-        )
-    # --advertise-as aliases don't merge across joins (the record's `advertise_as` is a flat, positionally
-    # keyed list), so appending onto — or with — an alias would drop an alias or mismatch the alias/model
-    # counts (which crashes the reload's _advertised_models). Reject any changing append touching aliases;
-    # the no-op case already returned earlier, so `live` here means a real change (ADR 0010).
-    aliased = bool(getattr(args, "advertise_as", []) or []) or any(rec.get("advertise_as") for rec in live)
-    if aliased and (len(merged_specs) > 1 or live):
-        raise SystemExit(
-            "--advertise-as aliases are single-engine and don't merge across joins. Run `grid leave`, "
-            "then re-join every engine in one command with its -m/--advertise-as pairs."
-        )
+def _reject_unserveable_union(merged_specs: list[dict[str, object]]) -> None:
+    """Guard the merged union before anything is stopped or written.
+
+    Several built-in engines, and built-in engines beside external ones, are servable: each built-in
+    launches its own llama-server, and every engine carries its own aliases, so aliases merge across
+    joins (ADR 0045 — this used to refuse both, per ADR 0007 D4 and ADR 0010 D2). What is left to refuse
+    is an engine whose aliases no longer line up with its models once merged — two models given one
+    alias, say. The detached child would refuse that at start-up, after the engine already serving had
+    been stopped, so it is refused here while nothing has changed yet.
+    """
+    from . import provider
+
+    for spec in merged_specs:
+        if spec.get("advertise_as"):
+            provider._advertised_text_models(list(spec.get("models") or []), list(spec["advertise_as"]))
 
 
 def _media_key(record: dict[str, object]) -> tuple[bool, tuple[str, ...], int, int]:
@@ -1232,6 +1262,12 @@ def _hot_reloadable(
     # server the serve loop starts at spawn. Reloading one would advertise its models against a
     # port with nothing listening.
     if any(not spec.get("endpoint_url") or _needs_local_process(spec) for spec in merged_specs):
+        return False
+    # An older child reads one flat alias list and refuses a union with several aliased engines — after
+    # this CLI had already printed "hot-reloaded". Only a child that stamped `per_engine_aliases` itself
+    # (remote/serve `_stamp_own_pid`) may be signalled one; anything else respawns (ADR 0045).
+    several_aliased = len(merged_specs) > 1 and any(spec.get("advertise_as") for spec in merged_specs)
+    if several_aliased and singleton.get("per_engine_aliases") is not True:
         return False
     # The poll-worker pool is sized once at spawn and a reload can't resize it (remote/serve
     # `_assemble_snapshot` pins the advertised capacity to the live pool). When this update flips
@@ -1285,6 +1321,9 @@ def _hot_reload_identity(
     record["pid"] = pid
     record["pid_start_time"] = singleton.get("pid_start_time")
     record["pgid"] = singleton.get("pgid")
+    # What the process said about itself stays true of it — and must not be claimed for it by this
+    # build's record, which it never read at start-up (ADR 0045).
+    record["per_engine_aliases"] = singleton.get("per_engine_aliases")
     # …and its clock. `_build_record` stamps `started_at` = now for every join, which is right for
     # `_respawn_identity` (a genuinely new process) and wrong here: nothing restarted. Left uncarried,
     # any hot-reloadable append to a WEDGED engine resets its uptime, putting it back inside the
@@ -1344,6 +1383,7 @@ def _respawn_identity(
         )
 
     record.update(run_records.identity_stamp(0))  # clear pid AND its identity — never a stale token
+    record.pop("per_engine_aliases", None)  # the child about to start says this itself (ADR 0045)
     # …and never a stale registration (grid-leave issue 10). The child about to be spawned has told
     # the relay nothing yet. `started_at` is refreshed with it so "up 42s" measures THIS process:
     # `_leave_one_engine` rebuilds its record by copying a survivor's, which carries the old one's.
@@ -1426,7 +1466,12 @@ def _resolve_serve_targets(args: argparse.Namespace) -> tuple[list[dict[str, obj
             raise SystemExit("--at requires at least one -m/--model naming what that engine serves.")
         return [{"endpoint_url": args.at, "models": list(args.models), "engine_label": None}], False
     if args.serve:
-        return [{"endpoint_url": None, "models": [args.serve], "engine_label": None}], False
+        return [{
+            "endpoint_url": None, "models": [args.serve], "engine_label": None,
+            # Its own settings, so a later join's flags retune only the engine that join names (ADR 0045).
+            "launch": {field: getattr(args, field, None) for field in run_records.BUILTIN_LAUNCH_FIELDS}
+            | {"endpoint_port": getattr(args, "endpoint_port", None) or 8081},
+        }], False
     if args.models:
         raise SystemExit("-m/--model names models for an engine; pair it with --at <url>, or use --serve <model>.")
     if getattr(args, "media", False):
@@ -1463,12 +1508,28 @@ def _resolve_serve_targets(args: argparse.Namespace) -> tuple[list[dict[str, obj
     ], media_detected
 
 
+def _attach_aliases(specs: list[dict[str, object]], aliases: list[str]) -> None:
+    """Give this join's ``--advertise-as`` to the one engine it names, validated here — where the person
+    typing can see the error — rather than by the detached child. The aliases live on that engine's
+    spec, so a later join that appends another engine keeps them (ADR 0045)."""
+    if not aliases:
+        return
+    if len(specs) != 1:
+        raise SystemExit(
+            "--advertise-as names the models of one engine; join each engine with its own --advertise-as."
+        )
+    from . import provider
+
+    specs[0]["advertise_as"] = provider._advertised_text_models(list(specs[0]["models"]), aliases)
+
+
 def _warn_shadowed_models(specs: list[dict[str, object]]) -> None:
-    """Warn when two engines advertise the same model — the first detected wins (ADR 0007 / D9)."""
+    """Warn when two engines advertise the same name — the first detected wins (ADR 0007 / D9). The
+    name is the advertised one: an alias is what the relay routes on."""
     owner: dict[str, str] = {}
     for spec in specs:
-        label = str(spec.get("engine_label") or spec.get("endpoint_url") or "an engine")
-        for model in spec["models"]:
+        label = str(spec.get("engine_label") or spec.get("endpoint_url") or _builtin_label(spec))
+        for model in spec.get("advertise_as") or spec["models"]:
             if model in owner:
                 print(
                     f"Note: model {model!r} is served by more than one engine; routing it to "
@@ -1477,6 +1538,11 @@ def _warn_shadowed_models(specs: list[dict[str, object]]) -> None:
                 )
             else:
                 owner[model] = label
+
+
+def _builtin_label(spec: dict[str, object]) -> str:
+    """How a person names a built-in engine, which has no URL: by the model it serves."""
+    return f"built-in {','.join(str(m) for m in spec.get('models') or []) or 'engine'}"
 
 
 def _build_record(
@@ -1525,7 +1591,9 @@ def _build_record(
         "media_bundles": list(bundles if bundles is not None else (getattr(args, "bundles", []) or [])),
         "comfyui_port": getattr(args, "comfyui_port", 8188),
         "media_port": getattr(args, "media_port", 8190),
-        "advertise_as": list(getattr(args, "advertise_as", []) or []),
+        # Each spec holds its own aliases (ADR 0045); this flat copy is what readers of the record
+        # (`own_model_case`, `grid engines`) and an older serve child already know how to read.
+        "advertise_as": run_records.union_aliases(specs),
         "engine_label": getattr(args, "engine_label", None),
         "pricing_input": getattr(args, "pricing_input", None),
         "pricing_output": getattr(args, "pricing_output", None),
@@ -2104,7 +2172,7 @@ def _leave_one_engine(
     to_drop = _drop_spec(union, args.engine, label, _identity_field(survivors, "meta_name"))
     if not to_drop:
         raise SystemExit(
-            f"No engine {args.engine!r} on {label} (match by endpoint URL, a served model, or a URL "
+            f"No engine {args.engine!r} on {label} (match by endpoint URL, a served model or its alias, or a URL "
             f"fragment). Engines: {_engines_summary(union)}."
         )
     drop_ids = {id(spec) for spec in to_drop}  # filter by identity — value-equal specs must not both drop
@@ -2128,6 +2196,7 @@ def _leave_one_engine(
     record["engines"] = remaining
     record["models"] = list(dict.fromkeys(m for spec in remaining for m in spec.get("models") or []))
     record["endpoint_url"] = remaining[0]["endpoint_url"] if len(remaining) == 1 else None
+    record["advertise_as"] = run_records.union_aliases(remaining)  # the dropped engine's aliases go with it
     record["media"] = media  # recompute from the survivors, don't inherit the arbitrary template's flag
     record["media_bundles"] = list(dict.fromkeys(b for rec in survivors for b in (rec.get("media_bundles") or [])))
     record.pop("last_reload_error", None)  # a fresh lifecycle attempt shouldn't inherit a stale failure

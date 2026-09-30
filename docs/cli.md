@@ -312,8 +312,8 @@ Join them:
 
 Engine IDs are local names shown by `grid engine ls`, `grid info`, and `grid models --verbose`.
 `grid leave --engine <sel>` takes an exact engine id, or — tried in that order — an endpoint URL,
-an engine label (the engine kind, e.g. `openai` or `codex`), a served model, or a URL fragment such
-as `:8000`. Each step must resolve to exactly one engine, or it errors listing the candidates.
+an engine label (the engine kind, e.g. `openai` or `codex`), a served model or its `--advertise-as`
+alias, or a URL fragment such as `:8000`. Each step must resolve to exactly one engine, or it errors listing the candidates.
 
 ### `grid join` in remote mode
 
@@ -327,6 +327,21 @@ token), so the models drop at the node TTL (~120s) and it says so. `grid
 join --all` serves several detected engines under **one** identity: it advertises the union of their
 models and routes each job to the engine that serves the requested model (first-detected wins when
 two engines share a model name).
+
+One machine can serve **several models on one grid**. Each `grid join` adds to what this box already
+serves there — `--at` engines, API engines, and any number of built-in `--serve` models, each of which
+runs its own llama-server on the next free port with the flags of the join that named it (`--ctx-size`,
+`--parallel`, `--reasoning-budget`, …). `--advertise-as` belongs to the engine it was given for, so a
+later join never drops it. Adding or removing a built-in model restarts the serving process, since a
+reload cannot launch or stop a llama-server; `grid leave --engine <model or alias>` removes one engine
+and keeps the rest. See [ADR 0045](./adr/0045-one-machine-serves-several-models-on-a-grid.md).
+
+```bash
+grid join mygrid --serve coder.gguf  --advertise-as coder  --ctx-size 131072
+grid join mygrid --serve vision.gguf --advertise-as vision --ctx-size 65536
+grid join mygrid --at http://127.0.0.1:8080/v1 -m mlx-community/Some-Model-4bit --advertise-as mlx-model
+grid leave mygrid --engine vision            # the other two keep serving
+```
 
 Re-running a join that changes nothing is a **no-op** — but only when the engine is actually serving.
 The serve loop records when it registered with the relay and touches a heartbeat file beside its run
@@ -494,12 +509,13 @@ The `grid join` flag set is the union of both modes, gated by mode:
   `--pricing-output` — kept so old invocations don't hard-error, but they no longer advertise a price.
   Set your authoritative per-model price with `grid price set` (see [Price](#price)) instead.
 
-A flag used in the wrong mode fails with a clear message. (`--advertise-as` is single-engine only: a
-join whose merged union holds more than one engine — or an append onto an identity already serving —
-is rejected, and the aliases must be re-passed in one command after `grid leave`. Locally, an alias
-count that does not match the `-m` count fails the join.) See [ADR 0004](./adr/0004-remote-provider-serve.md),
-[ADR 0007](./adr/0007-remote-multi-engine-routing.md), and
-[ADR 0008](./adr/0008-remote-media-serve.md).
+A flag used in the wrong mode fails with a clear message. (`--advertise-as` names the models of the one
+engine a join names — one alias per `-m` — so it is refused with `--all`; in remote mode it stays with
+that engine across later joins. An alias count that does not match the `-m` count, or two models of one
+engine given the same alias, fails the join before anything is restarted.) See
+[ADR 0004](./adr/0004-remote-provider-serve.md), [ADR 0007](./adr/0007-remote-multi-engine-routing.md),
+[ADR 0008](./adr/0008-remote-media-serve.md), and
+[ADR 0045](./adr/0045-one-machine-serves-several-models-on-a-grid.md).
 
 ## Models
 

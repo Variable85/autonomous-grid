@@ -9590,17 +9590,29 @@ def test_remote_join_appending_same_url_is_noop(monkeypatch, tmp_path, capsys):
     assert "already serving" in capsys.readouterr().out.lower()
 
 
-def test_remote_join_appending_builtin_into_external_union_is_rejected(monkeypatch, tmp_path):
-    """The built-in `--serve` engine serves one model and cannot join a multi-engine union (external-only)."""
+def test_remote_join_appending_builtin_into_external_union_serves_both(monkeypatch, tmp_path):
+    """A built-in `--serve` engine joins an identity already serving an external one (ADR 0045) —
+    it used to be refused (ADR 0007 D4). It needs a llama-server launched, which a hot-reload cannot
+    do, so the identity is respawned rather than signalled."""
+    import signal as _sig
+
     _seed_running_remote_grid(monkeypatch, tmp_path)
-    _mock_remote_spawn(monkeypatch)
-    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: None)
+    spawned = _mock_remote_spawn(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: terminated.append(pid) or True)
 
     assert cli.main(["join", "--at", "http://h:11434/v1", "-m", "llama3"]) == 0
     monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["join", "--serve", "qwen"])
-    assert "leave" in str(exc.value).lower()  # guidance: leave then re-join all as --at
+    assert cli.main(["join", "--serve", "qwen.gguf", "--ctx-size", "65536"]) == 0
+
+    rec = cli.provider._read_records("n1")["remote"]
+    external, builtin = rec["engines"]
+    assert external["endpoint_url"] == "http://h:11434/v1" and "launch" not in external
+    assert builtin["endpoint_url"] is None and builtin["models"] == ["qwen.gguf"]
+    assert builtin["launch"]["ctx_size"] == 65536  # the flags of the join that named it
+    assert rec["models"] == ["llama3", "qwen.gguf"]
+    assert terminated == [4242]                           # respawned to launch the llama-server...
+    assert (4242, _sig.SIGHUP) not in spawned["signals"]  # ...never a reload that can't launch it
 
 
 def test_remote_join_adopts_and_stops_legacy_live_record(monkeypatch, tmp_path):
@@ -9681,33 +9693,146 @@ def test_remote_join_rename_hot_reloads_meta_name(monkeypatch, tmp_path):
     assert terminated == []
 
 
-def test_remote_join_append_onto_aliased_identity_is_rejected(monkeypatch, tmp_path):
-    """Appending a 2nd engine onto a single-engine identity that uses --advertise-as is rejected (aliases
-    are single-engine only, ADR 0007 D4) instead of silently dropping the alias."""
+def test_remote_join_append_onto_aliased_identity_keeps_the_alias(monkeypatch, tmp_path):
+    """Appending a 2nd engine onto an identity whose engine uses --advertise-as keeps that alias on
+    that engine (ADR 0045). It used to be refused, because one flat alias list could not say which
+    engine an alias belonged to."""
     _seed_running_remote_grid(monkeypatch, tmp_path)
     _mock_remote_spawn(monkeypatch)
     monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: True)
 
     assert cli.main(["join", "--at", "http://h:11434/v1", "-m", "real", "--advertise-as", "public"]) == 0
     monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["join", "--at", "http://h:8000/v1", "-m", "mistral"])
-    assert "advertise-as" in str(exc.value).lower()
+    assert cli.main(["join", "--at", "http://h:8000/v1", "-m", "mistral"]) == 0
+
+    rec = cli.provider._read_records("n1")["remote"]
+    assert [e.get("advertise_as") for e in rec["engines"]] == [["public"], None]
+    assert rec["advertise_as"] == ["public", "mistral"]  # the flat view every older reader knows
 
 
-def test_remote_join_rejoin_aliased_engine_with_new_alias_is_rejected(monkeypatch, tmp_path):
-    """Re-joining ONE engine with a second -m/--advertise-as would mismatch the alias/model counts and
-    crash the reload's _advertised_models (SystemExit); the CLI rejects it up front instead — aliases
-    don't merge across joins (reviewer CRITICAL root cause)."""
+def test_remote_join_rejoin_aliased_engine_with_new_alias_adds_the_pair(monkeypatch, tmp_path):
+    """Re-joining ONE aliased engine with a second -m/--advertise-as pair adds the pair — the alias
+    list grows with the model list, so the reload's `_advertised_models` never sees a count mismatch
+    (it used to be refused for exactly that reason)."""
     _seed_running_remote_grid(monkeypatch, tmp_path)
     _mock_remote_spawn(monkeypatch)
     monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: True)
 
     assert cli.main(["join", "--at", "http://h:11434/v1", "-m", "m1", "--advertise-as", "a1"]) == 0
     monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
+    assert cli.main(["join", "--at", "http://h:11434/v1", "-m", "m2", "--advertise-as", "a2"]) == 0
+
+    (engine,) = cli.provider._read_records("n1")["remote"]["engines"]
+    assert engine["models"] == ["m1", "m2"] and engine["advertise_as"] == ["a1", "a2"]
+
+
+def test_remote_join_merge_that_would_repeat_an_alias_is_refused_before_anything_stops(monkeypatch, tmp_path):
+    """Two models of one engine may not share an alias — the child would refuse it at start-up, after
+    the engine already serving had been stopped — so the CLI refuses it first, with nothing touched."""
+    _seed_running_remote_grid(monkeypatch, tmp_path)
+    _mock_remote_spawn(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: terminated.append(pid) or True)
+
+    assert cli.main(["join", "--at", "http://h:11434/v1", "-m", "m1", "--advertise-as", "same"]) == 0
+    monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
     with pytest.raises(SystemExit) as exc:
-        cli.main(["join", "--at", "http://h:11434/v1", "-m", "m2", "--advertise-as", "a2"])  # same engine, 2nd pair
-    assert "advertise-as" in str(exc.value).lower()
+        cli.main(["join", "--at", "http://h:11434/v1", "-m", "m2", "--advertise-as", "same"])
+    assert "unique" in str(exc.value).lower()
+    assert terminated == []
+    assert cli.provider._read_records("n1")["remote"]["engines"][0]["models"] == ["m1"]
+
+
+def test_remote_join_two_builtin_models_each_keep_their_own_settings(monkeypatch, tmp_path):
+    """Two `--serve` joins on one grid serve both models (ADR 0045) — this was "can't join a
+    multi-engine identity". The second join's flags tune only the engine it names."""
+    _seed_running_remote_grid(monkeypatch, tmp_path)
+    _mock_remote_spawn(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: terminated.append(pid) or True)
+
+    assert cli.main(["join", "--serve", "coder.gguf", "--advertise-as", "Coder", "--ctx-size", "131072",
+                     "--reasoning-budget", "0"]) == 0
+    monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
+    assert cli.main(["join", "--serve", "vision.gguf", "--advertise-as", "Vision", "--ctx-size", "65536"]) == 0
+
+    rec = cli.provider._read_records("n1")["remote"]
+    coder, vision = rec["engines"]
+    assert (coder["models"], coder["advertise_as"]) == (["coder.gguf"], ["Coder"])
+    assert (coder["launch"]["ctx_size"], coder["launch"]["reasoning_budget"]) == (131072, 0)  # untouched
+    assert (vision["models"], vision["advertise_as"]) == (["vision.gguf"], ["Vision"])
+    assert (vision["launch"]["ctx_size"], vision["launch"]["reasoning_budget"]) == (65536, None)
+    assert rec["advertise_as"] == ["Coder", "Vision"]
+    assert terminated == [4242]  # one respawn brings up both llama-servers
+
+
+def test_remote_join_onto_a_legacy_builtin_record_moves_its_settings_onto_its_engine(monkeypatch, tmp_path):
+    """A live identity written when it could hold one built-in keeps that engine's settings and alias
+    at the top level. Appending an external engine moves them onto the built-in's own spec first, so
+    the new join's flags (here: none) can't retune or un-alias it."""
+    _seed_running_remote_grid(monkeypatch, tmp_path)
+    _mock_remote_spawn(monkeypatch)
+    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: True)
+    monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
+    _seed_live_identity_record(
+        pid=4242, engines=[{"endpoint_url": None, "models": ["lfm.gguf"], "engine_label": None}],
+        advertise_as=["LFM"], endpoint_port=8081, ctx_size=16384, reasoning_budget=0, max_concurrency=1,
+    )
+
+    assert cli.main(["join", "--at", "http://127.0.0.1:8084/v1", "-m", "/snap", "--advertise-as", "Qwen"]) == 0
+
+    rec = cli.provider._read_records("n1")["remote"]
+    builtin, external = rec["engines"]
+    assert builtin["advertise_as"] == ["LFM"]
+    assert (builtin["launch"]["ctx_size"], builtin["launch"]["reasoning_budget"]) == (16384, 0)
+    assert external["advertise_as"] == ["Qwen"] and "launch" not in external
+    assert rec["advertise_as"] == ["LFM", "Qwen"]
+    assert rec["max_concurrency"] == 1
+
+
+def test_remote_leave_engine_by_alias_drops_one_builtin(monkeypatch, tmp_path):
+    """A built-in engine has no URL; its alias is how a person names it to `grid leave --engine`."""
+    _seed_remote_identity(monkeypatch, tmp_path, [
+        {"endpoint_url": None, "models": ["coder.gguf"], "advertise_as": ["Coder"], "launch": {"ctx_size": 131072}},
+        {"endpoint_url": None, "models": ["vision.gguf"], "advertise_as": ["Vision"], "launch": {"ctx_size": 65536}},
+    ])
+    _mock_remote_spawn(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: terminated.append(pid) or True)
+    monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
+
+    assert cli.main(["leave", "--engine", "Coder"]) == 0
+
+    rec = cli.provider._read_records("n1")["remote"]
+    (survivor,) = rec["engines"]
+    assert survivor["models"] == ["vision.gguf"] and survivor["launch"]["ctx_size"] == 65536
+    assert rec["advertise_as"] == ["Vision"]  # the dropped engine's alias went with it
+    assert terminated == [4242]                # built-ins can't be hot-reloaded: respawned
+
+
+def test_remote_join_several_aliased_engines_respawn_an_older_child(monkeypatch, tmp_path):
+    """An older child reads one flat alias list and refuses a union with several aliased engines, after
+    the CLI would already have said "hot-reloaded". A child that never stamped `per_engine_aliases` is
+    respawned instead; one that did is hot-reloaded, and keeps its stamp across the reload."""
+    import signal as _sig
+
+    _seed_running_remote_grid(monkeypatch, tmp_path)
+    spawned = _mock_remote_spawn(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(cli.remote_provider.run_records, "terminate_pid", lambda pid: terminated.append(pid) or True)
+    monkeypatch.setattr(cli.remote_provider.run_records, "pid_alive", lambda pid: True)
+    engine = {"endpoint_url": "http://h:11434/v1", "models": ["real"], "engine_label": None}
+
+    _seed_live_identity_record(pid=4242, engines=[engine], advertise_as=["public"])  # older child: no stamp
+    assert cli.main(["join", "--at", "http://h:8000/v1", "-m", "mistral"]) == 0
+    assert terminated == [4242] and spawned["signals"] == []
+
+    terminated.clear()
+    _seed_live_identity_record(pid=4242, engines=[dict(engine, advertise_as=["public"])],
+                               advertise_as=["public"], per_engine_aliases=True)
+    assert cli.main(["join", "--at", "http://h:8000/v1", "-m", "mistral"]) == 0
+    assert terminated == [] and spawned["signals"] == [(4242, _sig.SIGHUP)]
+    assert cli.provider._read_records("n1")["remote"]["per_engine_aliases"] is True
 
 
 def test_remote_join_aborts_when_prior_process_wont_die(monkeypatch, tmp_path):
@@ -15109,6 +15234,20 @@ def test_stamp_own_pid_overwrites_a_stale_spawner_value(monkeypatch, tmp_path):
     assert run_records.read_record("n1", "remote")["pid"] == os.getpid()
 
 
+def test_stamp_own_pid_says_this_child_reads_each_engines_aliases(monkeypatch, tmp_path):
+    """Only the child can vouch for what its reload understands; the CLI gates a hot-reload of several
+    aliased engines on this stamp (ADR 0045)."""
+    from remote import serve
+    from shared import run_records
+
+    monkeypatch.setenv("GRID_HOME", str(tmp_path))
+    run_records.write_record("n1", "remote", {"engine_id": "remote", "grid_id": "n1", "pid": 0})
+
+    serve._stamp_own_pid("n1", "remote")
+
+    assert run_records.read_record("n1", "remote")["per_engine_aliases"] is True
+
+
 def test_stamp_own_pid_preserves_sibling_fields(monkeypatch, tmp_path):
     """Only the **identity** changes: a concurrent CLI join-append (under the same record lock) that
     added engines/models/meta must keep every field it wrote — the stamp merges, never clobbers.
@@ -15131,7 +15270,8 @@ def test_stamp_own_pid_preserves_sibling_fields(monkeypatch, tmp_path):
     serve._stamp_own_pid("n1", "remote")
 
     got = run_records.read_record("n1", "remote")
-    identity = set(run_records.identity_stamp(os.getpid()))
+    # The identity, plus the one thing the child declares about itself (ADR 0045); nothing else moves.
+    identity = set(run_records.identity_stamp(os.getpid())) | {"per_engine_aliases"}
     assert got["pid"] == os.getpid()
     assert got["pgid"] == os.getpgrp()
     assert run_records.record_verdict(got) is run_records.RecordVerdict.LIVE_OURS
@@ -20309,16 +20449,142 @@ def test_bring_up_engines_falls_back_to_flat_record(monkeypatch, tmp_path):
     assert results[0][2] == ["llama3"]  # upstream == advertised when no alias
 
 
-def test_bring_up_engines_rejects_multi_without_endpoints(monkeypatch, tmp_path):
+def _fake_builtin_launcher(monkeypatch, *, taken=()):
+    """The built-in llama-server launch with every process faked: `start_llm` records its arguments
+    and binds its port, so the next launch finds it taken exactly as a real one would. Returns the
+    list of launch calls and the list of ports stopped."""
+    from types import SimpleNamespace
+
+    from local import runtime
+    from shared.engine import launcher
+
+    bound = set(taken)
+    calls, stopped = [], []
+    monkeypatch.setattr(runtime, "port_in_use", lambda port: port in bound)
+    monkeypatch.setattr(runtime, "port_holder", lambda port, *a, **k: None)
+    monkeypatch.setattr(runtime, "free_port_from",
+                        lambda start, *a, **k: next(p for p in range(start, start + 40) if p not in bound))
+    monkeypatch.setattr(launcher, "assert_supported_build", lambda: None)
+
+    def start_llm(model, *, port, **kwargs):
+        bound.add(port)
+        calls.append({"model": model, "port": port, **kwargs})
+        return SimpleNamespace(proc=SimpleNamespace(pid=9000 + len(calls)), log=f"llama-{port}.log", port=port)
+
+    monkeypatch.setattr(launcher, "start_llm", start_llm)
+    monkeypatch.setattr(launcher, "wait_for_models", lambda launched: None)
+    monkeypatch.setattr(launcher, "stop", lambda launched: stopped.append(launched.port))
+    return calls, stopped
+
+
+def _probe_recording_ctx(monkeypatch):
+    """Probe stub that records the context window each advertised model was probed with."""
+    from remote import probe
+
+    seen = {}
+    monkeypatch.setattr(probe, "probe_responses_endpoint", lambda *a, **k: False)
+    monkeypatch.setattr(probe, "capabilities",
+                        lambda url, model, *, advertise_as=None, context_window=None, **_:
+                        seen.update({advertise_as or model: context_window})
+                        or {"schema_version": 1, "models": {advertise_as or model: {}}})
+    return seen
+
+
+def test_bring_up_engines_launches_each_builtin_with_its_own_settings(monkeypatch, tmp_path):
+    """Several built-in engines serve under one identity beside an external one (ADR 0045): each gets
+    its own llama-server — its own port, context, slots, projector and alias — and its own route."""
     from remote import serve
 
+    calls, _stopped = _fake_builtin_launcher(monkeypatch, taken={8081})
+    ctx_seen = _probe_recording_ctx(monkeypatch)
     record = {"engines": [
-        {"endpoint_url": "http://h:11434/v1", "models": ["a"], "engine_label": "ollama"},
-        {"endpoint_url": None, "models": ["b"], "engine_label": None},  # would need a built-in launch
-    ], "advertise_as": []}
-    with pytest.raises(SystemExit) as exc:
+        {"endpoint_url": "http://h:11434/v1", "models": ["llama3"], "engine_label": "ollama"},
+        {"endpoint_url": None, "models": ["coder.gguf"], "advertise_as": ["Coder"],
+         "launch": {"endpoint_port": 8081, "ctx_size": 131072, "parallel": 2}},
+        {"endpoint_url": None, "models": ["vision.gguf"],
+         "launch": {"endpoint_port": 8081, "ctx_size": 65536, "mmproj": "vision.mmproj.gguf"}},
+    ], "advertise_as": ["llama3", "Coder", "vision.gguf"], "ctx_size": None}
+
+    results, launched, _launcher = serve._bring_up_engines(record)
+
+    assert [c["port"] for c in calls] == [8082, 8083]  # 8081 was taken; each finds the one before it bound
+    assert [(c["model"], c["ctx_size"], c["alias"]) for c in calls] == [
+        ("coder.gguf", 131072, "Coder"), ("vision.gguf", 65536, "vision.gguf")]
+    assert calls[0]["parallel"] == 2 and calls[1]["parallel"] == 1
+    assert calls[1]["mmproj"] == "vision.mmproj.gguf" and calls[0]["mmproj"] is None
+    assert len(launched) == 2
+    assert [r[0] for r in results] == [
+        "http://h:11434/v1", "http://127.0.0.1:8082/v1", "http://127.0.0.1:8083/v1"]
+    assert [r[1] for r in results] == [["llama3"], ["Coder"], ["vision.gguf"]]
+    assert ctx_seen["Coder"] == 131072 and ctx_seen["vision.gguf"] == 65536  # advertised as launched
+
+    routes, _upstream, models, _caps, _warnings = serve._build_routing(results)
+    assert routes == {"llama3": "http://h:11434/v1", "Coder": "http://127.0.0.1:8082/v1",
+                      "vision.gguf": "http://127.0.0.1:8083/v1"}
+    assert models == ["llama3", "Coder", "vision.gguf"]
+
+
+def test_bring_up_engines_stops_earlier_builtins_when_a_later_one_fails(monkeypatch, tmp_path):
+    """A built-in that never becomes ready must not strand the llama-servers launched before it."""
+    from remote import serve
+    from shared.engine import launcher
+
+    calls, stopped = _fake_builtin_launcher(monkeypatch)
+    _probe_recording_ctx(monkeypatch)
+
+    def wait_for_models(launched):
+        if launched.port == 8082:
+            raise SystemExit("model failed to load")
+
+    monkeypatch.setattr(launcher, "wait_for_models", wait_for_models)
+    record = {"engines": [
+        {"endpoint_url": None, "models": ["a.gguf"], "launch": {"endpoint_port": 8081}},
+        {"endpoint_url": None, "models": ["b.gguf"], "launch": {"endpoint_port": 8081}},
+    ]}
+
+    with pytest.raises(SystemExit, match="failed to load"):
         serve._bring_up_engines(record)
-    assert "external endpoints" in str(exc.value).lower()
+    assert [c["port"] for c in calls] == [8081, 8082]
+    assert sorted(stopped) == [8081, 8082]  # the failed one, and the one launched before it
+
+
+def test_bring_up_engines_legacy_builtin_record_launches_from_top_level_fields(monkeypatch, tmp_path):
+    """A record written when an identity held one built-in keeps its settings and alias at the top
+    level; it still launches exactly as it did."""
+    from remote import serve
+
+    calls, _stopped = _fake_builtin_launcher(monkeypatch)
+    _probe_recording_ctx(monkeypatch)
+    record = {"engines": [{"endpoint_url": None, "models": ["lfm.gguf"], "engine_label": None}],
+              "advertise_as": ["LFM"], "endpoint_port": 8090, "ctx_size": 16384, "reasoning_budget": 0}
+
+    results, _launched, _ = serve._bring_up_engines(record)
+
+    (call,) = calls
+    assert (call["port"], call["ctx_size"], call["reasoning_budget"], call["alias"]) == (8090, 16384, 0, "LFM")
+    assert results[0][1] == ["LFM"]
+
+
+def test_serve_reload_accepts_several_aliased_external_engines(monkeypatch, tmp_path):
+    """Each engine carries its own aliases (ADR 0045), so a union of several aliased external engines
+    hot-reloads — it used to be refused, when one flat list could not say whose alias was whose."""
+    from remote import probe, relay, serve
+
+    state = _seed_reload_state(monkeypatch, tmp_path, retained=[
+        ("http://e1/v1", ["A"], ["a"], {"schema_version": 1, "models": {"A": {}}}),
+    ], engines=[
+        {"endpoint_url": "http://e1/v1", "models": ["a"], "advertise_as": ["A"], "engine_label": None},
+        {"endpoint_url": "http://e2/v1", "models": ["b"], "advertise_as": ["B"], "engine_label": None},
+    ])
+    monkeypatch.setattr(probe, "capabilities",
+                        lambda url, model, *, advertise_as=None, **kw: {"schema_version": 1, "models": {advertise_as or model: {}}})
+    seen = {}
+    monkeypatch.setattr(relay, "register_node", lambda url, tok, node, **kw: seen.update(kw))
+
+    serve._reload_once(state, "remote")
+
+    assert seen["models"] == ["A", "B"]
+    assert state.upstream_model("B") == "b"  # forwarded to the engine by the name it answers to
 
 
 # ---------------------------------------------------------------------------

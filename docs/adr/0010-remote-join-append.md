@@ -1,6 +1,8 @@
 # ADR 0010 — Remote `grid join` is additive (one identity per grid)
 
-Status: accepted (2026-07-02) — supersedes **ADR 0007 Decision 1 for remote mode**. Shipped as **Slice 1**
+Status: accepted (2026-07-02) — supersedes **ADR 0007 Decision 1 for remote mode**. Its external-only guard
+(D2) and the "aliases don't merge across joins" rule are superseded by
+[ADR 0045](./0045-one-machine-serves-several-models-on-a-grid.md). Shipped as **Slice 1**
 (singleton + additive append via **stop-respawn** + leave + migration), then **Slice 2** (SIGHUP hot-reload
 for zero-drop append/shrink/rename, Decisions 3 & 4). Slice 2's gate — a live append-during-stream test —
 was **CLEARED 2026-07-03** on the hosted relay (see "On the zero-drop claim" below); it is now implemented,
