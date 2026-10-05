@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -18,6 +19,9 @@ from shared.models import gguf
 
 
 MIN_LLAMA_SERVER_BUILD = 9240
+# The first llama.cpp build with `/v1/systemone` (ggml-org/llama.cpp#29818). An older server loads a
+# decision GGUF as a bare encoder and answers nothing, so `start_llm` refuses it up front instead.
+MIN_DECISION_BUILD = 11361
 
 
 @dataclass
@@ -207,6 +211,13 @@ def start_llm(
             f"  Download it:   grid pull {Path(model_file).stem}\n"
             "  Or see what is already here:   grid catalog"
         )
+    if gguf.decision_type(model_path):
+        build = parse_version()
+        if build is not None and build > 1 and build < MIN_DECISION_BUILD:
+            raise SystemExit(
+                f"{model_path.name} is a decision model, and llama-server build {build} cannot serve "
+                f"it; need >= {MIN_DECISION_BUILD}. Run `grid engine install llama.cpp`."
+            )
 
     log = paths.llama_log(port)
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +388,12 @@ def parse_version(timeout: float = 5.0) -> int | None:
         stripped = line.strip()
         if "version:" not in stripped:
             continue
+        # Builds since llama.cpp's semver releases print `version: 0.5.0 (build 11146, commit …)`;
+        # older ones print `version: 10369 (6e62ba538)`. Reading only the second shape made every
+        # newer build parse as None, which every build check here reads as "fine".
+        build = re.search(r"\(build (\d+)", stripped)
+        if build:
+            return int(build.group(1))
         try:
             return int(stripped.split("version:", 1)[1].strip().split()[0])
         except (ValueError, IndexError):
