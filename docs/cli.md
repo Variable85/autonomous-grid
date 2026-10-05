@@ -531,6 +531,9 @@ grid join --serve Laya-Q8_0.gguf                # or --at an Ollama >= 0.35 serv
 - **No flag says "decision".** At join every model is asked one real three-question decision; a
   model that answers advertises `systemone`, and only `systemone` if it then refuses a one-token
   chat. Chat models are never asked to chat, so nothing changes for them.
+- **The first join after upgrading restarts the running engine once.** An engine started by an
+  older `grid` cannot serve decision models, so a join respawns it instead of hot-reloading it;
+  every join after that hot-reloads as before.
 - **It needs llama.cpp b11361 or newer** (the build that added `/v1/systemone`). `grid join --serve`
   refuses a decision GGUF on an older engine and names the fix: `grid engine install llama.cpp`.
 - **Jev's default model names reach it.** The names TypeSafe's and OpenJev's SDKs send by default —

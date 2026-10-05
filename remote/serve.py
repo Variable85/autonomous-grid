@@ -178,6 +178,10 @@ def _stamp_own_pid(grid_id: str, engine_id: str) -> None:
                 # running child it did not spawn, so only the child can vouch that its reload reads each
                 # engine's own aliases (ADR 0045). An older child never says it, and is respawned instead.
                 per_engine_aliases=True,
+                # Likewise that it probes and serves System One decision models: a decision model
+                # reloaded into an older child would be advertised as chat and every decision refused,
+                # so the join respawns any child that does not say this (`_hot_reloadable`).
+                serves_systemone=True,
             )
             # Declare, before any socket is opened, that this build reports service truth (issue 10).
             # The sidecar's ABSENCE is what keeps the join gate quiet about an older build's child, so

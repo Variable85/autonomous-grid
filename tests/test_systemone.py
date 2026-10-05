@@ -367,3 +367,85 @@ def test_the_catalog_offers_laya_as_a_decision_model_everywhere():
     for target in (catalog.TARGET_APPLE_SILICON, catalog.TARGET_NVIDIA):
         assert entry in catalog.recommended_entries(target)
     assert "decision" in catalog.format_catalog_entry(entry)
+
+
+# --- what `grid join` says to try next ---------------------------------------------------------
+
+
+def test_a_joined_decision_model_is_offered_a_decision_never_grid_chat(monkeypatch, tmp_path):
+    import argparse
+    import shlex
+
+    from cli import provider, remote_provider
+
+    monkeypatch.setenv("GRID_HOME", str(tmp_path))
+    paths.models_dir().mkdir(parents=True, exist_ok=True)
+    _write_gguf(paths.models_dir() / "Laya-Q8_0.gguf", {"modern-bert.decision.type": "laya"})
+    _write_gguf(paths.models_dir() / "qwen.gguf", {"general.architecture": "qwen3"})
+    asked = []
+    monkeypatch.setattr(probe, "probe_systemone", lambda url, model, **kw: asked.append((url, model)) or model == "nimble")
+
+    serve_laya = argparse.Namespace(serve="Laya-Q8_0.gguf", at=None, models=[], mmproj=None)
+    serve_qwen = argparse.Namespace(serve="qwen.gguf", at=None, models=[], mmproj=None)
+    at_nimble = argparse.Namespace(serve=None, at="http://127.0.0.1:11434/v1", models=["nimble"], mmproj=None)
+    assert provider.serves_decisions(serve_laya) and not provider.serves_decisions(serve_qwen)
+    assert provider.serves_decisions(at_nimble) and asked == [("http://127.0.0.1:11434/v1", "nimble")]
+    # A vendor's API sees no traffic at join — not even this probe.
+    vendor = argparse.Namespace(serve=None, at="https://api.openai.com/v1", models=["gpt-5.5"], api="openai", mmproj=None)
+    assert not provider.serves_decisions(vendor) and len(asked) == 1
+
+    hints = remote_provider._next_hints(serve_laya, "Laya-Q8_0", "'my grid'")
+    assert hints[0] == """  eval "$(grid info 'my grid' --env)\""""
+    assert not any("grid chat" in line for line in hints)
+    # The body is one shell word that parses back to a valid System One request.
+    body = json.loads(shlex.split(hints[-1])[-1])
+    assert body["model"] == "Laya-Q8_0" and body["questions"]["refund"]["type"] == "noul"
+    assert remote_provider._next_hints(serve_qwen, "qwen", "home")[0].startswith("  grid chat -m qwen")
+
+
+def test_a_slow_first_version_read_is_waited_for_before_a_decision_model_launches(monkeypatch, tmp_path):
+    """A cold binary can take longer than the usual read; a decision model asks again, longer."""
+    reads = iter([None, 10369])
+    asked = []
+
+    def version(timeout=5.0):
+        asked.append(timeout)
+        return next(reads)
+
+    monkeypatch.setenv("GRID_HOME", str(tmp_path))
+    paths.models_dir().mkdir(parents=True, exist_ok=True)
+    _write_gguf(paths.models_dir() / "laya.gguf", {"modern-bert.decision.type": "laya"})
+    monkeypatch.setattr(launcher, "parse_version", version)
+    with pytest.raises(SystemExit, match="build 10369 cannot serve"):
+        launcher.assert_serves(paths.models_dir() / "laya.gguf")
+    assert asked == [5.0, 30.0]
+
+
+def test_a_remote_join_refuses_a_decision_model_on_an_old_engine_before_it_spawns(monkeypatch, tmp_path):
+    import argparse
+
+    from cli import remote_provider
+
+    monkeypatch.setenv("GRID_HOME", str(tmp_path))
+    paths.models_dir().mkdir(parents=True, exist_ok=True)
+    _write_gguf(paths.models_dir() / "Laya-Q8_0.gguf", {"modern-bert.decision.type": "laya"})
+    args = argparse.Namespace(at=None, serve="Laya-Q8_0.gguf", models=[], media=False)
+    monkeypatch.setattr(launcher, "parse_version", lambda timeout=5.0: 11146)
+    with pytest.raises(SystemExit, match="grid engine install llama.cpp"):
+        remote_provider._resolve_serve_targets(args)
+    monkeypatch.setattr(launcher, "parse_version", lambda timeout=5.0: launcher.MIN_DECISION_BUILD)
+    specs, _ = remote_provider._resolve_serve_targets(args)
+    assert specs[0]["models"] == ["Laya-Q8_0.gguf"]
+
+
+def test_a_child_older_than_system_one_is_respawned_rather_than_reloaded():
+    """A decision model hot-reloaded into a child that predates System One would be advertised as chat
+    and every decision refused. Such a child never stamped `serves_systemone`; the join respawns it."""
+    from cli import remote_provider
+
+    external = [{"endpoint_url": "http://127.0.0.1:50104/v1", "models": ["laya-english"]}]
+    record = {"engines": external}
+    current = {"engine_id": "remote", "reload_signal": "sighup", "serves_systemone": True, "engines": []}
+    older = {key: value for key, value in current.items() if key != "serves_systemone"}
+    assert remote_provider._hot_reloadable([current], external, record) is True
+    assert remote_provider._hot_reloadable([older], external, record) is False

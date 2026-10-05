@@ -211,13 +211,7 @@ def start_llm(
             f"  Download it:   grid pull {Path(model_file).stem}\n"
             "  Or see what is already here:   grid catalog"
         )
-    if gguf.decision_type(model_path):
-        build = parse_version()
-        if build is not None and build > 1 and build < MIN_DECISION_BUILD:
-            raise SystemExit(
-                f"{model_path.name} is a decision model, and llama-server build {build} cannot serve "
-                f"it; need >= {MIN_DECISION_BUILD}. Run `grid engine install llama.cpp`."
-            )
+    assert_serves(model_path)
 
     log = paths.llama_log(port)
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +393,30 @@ def parse_version(timeout: float = 5.0) -> int | None:
         except (ValueError, IndexError):
             continue
     return None
+
+
+def assert_serves(model_path: Path) -> None:
+    """Refuse a decision GGUF on a llama-server too old to serve it — before anything is spawned.
+
+    An older build cannot even load one (its head blocks have shapes it does not expect), and nothing
+    upgrades an engine a machine already has when the pin moves: `grid engine install llama.cpp` does.
+    `start_llm` asks this at launch; a remote `grid join --serve` asks it up front, so the refusal
+    lands in the person's terminal rather than in a detached engine's log. A chat model, an unreadable
+    file, or a build that does not say passes.
+    """
+    if not gguf.decision_type(model_path):
+        return
+    build = parse_version()
+    if build is None:
+        # A first run can take seconds — macOS checks a binary it has not run lately (10.7 s measured
+        # for b10369, then 0.07 s) — past the 5 s that is plenty every other time. Unread here, an old
+        # build would go on to fail with llama.cpp's "wrong shape" instead of this, so it is worth one wait.
+        build = parse_version(timeout=30.0)
+    if build is not None and build > 1 and build < MIN_DECISION_BUILD:
+        raise SystemExit(
+            f"{model_path.name} is a decision model, and llama-server build {build} cannot serve "
+            f"it; need >= {MIN_DECISION_BUILD}. Run `grid engine install llama.cpp`."
+        )
 
 
 def assert_supported_build() -> None:
